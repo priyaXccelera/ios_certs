@@ -56,14 +56,21 @@ jobs:
       # non-zero exit rather than letting it abort the build.
       - name: Install iOS platform support files
         run: |
-          # Only download if the iOS SDK is genuinely missing.
-          # On GitHub-hosted macos-15 runners iPhoneOS.platform is pre-installed,
-          # so this check always skips — preventing an 8 GB simulator download
-          # that xcodebuild -downloadPlatform triggers as a side effect.
-          if xcodebuild -showsdks 2>/dev/null | grep -q "iphoneos"; then
-            echo "iOS SDK already present — skipping platform download."
+          # `xcodebuild -showsdks` always lists "iphoneos" because the iOS SDK
+          # (compile-time headers/frameworks) ships bundled inside every
+          # Xcode.app — that check tells us nothing about whether the actual
+          # device-support platform files are installed. Those live in a
+          # separate directory and are what's missing when archiving fails
+          # with "iOS <version> is not installed. To use with Xcode, first
+          # download and install the platform" even though -showsdks looks fine.
+          # Check for the real device-support directory instead.
+          PLATFORM_DIR="/Applications/Xcode_16.3.app/Contents/Developer/Platforms/iPhoneOS.platform/Library/Developer/CoreSimulator/Profiles/DeviceTypes"
+          DEVICE_SUPPORT_DIR="/Applications/Xcode_16.3.app/Contents/Developer/Platforms/iPhoneOS.platform/DeviceSupport"
+          if [ -d "$DEVICE_SUPPORT_DIR" ] && [ -n "$(ls -A "$DEVICE_SUPPORT_DIR" 2>/dev/null)" ]; then
+            echo "iOS device-support platform files already present — skipping download."
+            ls "$DEVICE_SUPPORT_DIR"
           else
-            echo "iOS SDK not found — downloading platform support files."
+            echo "iOS device-support platform files not found — downloading."
             xcodebuild -downloadPlatform iOS || true
           fi
 

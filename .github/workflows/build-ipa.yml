@@ -48,31 +48,29 @@ jobs:
       # case this workflow is ever pointed at a self-hosted/persistent runner,
       # where leftovers from a previous run (project/, build/, DerivedData,
       # CocoaPods caches) could otherwise corrupt or stale-out this run.
-      # xcodebuild -downloadPlatform iOS downloads iOS device-support files
-      # (NOT the simulator — the flag name is misleading). On macos-15 runners
-      # with Xcode 16.3 the daemon it pings exits 70 ("Unable to connect to
-      # simulator") even though we are targeting a real device. The platform
-      # files ARE pre-installed on GitHub-hosted macos-15, so we suppress the
-      # non-zero exit rather than letting it abort the build.
+      #
+      # Xcode 15+ decoupled iOS platform support (device-build metadata, the
+      # thing gym's default `generic/platform=iOS` archive destination needs)
+      # from the main Xcode.app download — it's a separate "Cryptex" package
+      # that has to be fetched with `xcodebuild -downloadPlatform iOS`. It is
+      # NOT reliably pre-installed on GitHub-hosted macos-15 runners for every
+      # Xcode point release (confirmed false for 16.3/iOS 18.4 by an actual
+      # failed run: "error: iOS 18.4 is not installed"). There is also no
+      # simple local file/dir to probe to know in advance whether it's
+      # present — `xcodebuild -showsdks` always lists iphoneos regardless
+      # (that's the compile-time SDK, a different thing), and Apple moved the
+      # real platform bundles to an internal location that isn't a stable
+      # public path to check across Xcode versions. So: just always run the
+      # download — it's a fast idempotent no-op if already installed — and do
+      # NOT swallow its exit code, so an auth/network failure here surfaces
+      # immediately with a clear message instead of a confusing failure deep
+      # inside `gym` several minutes later.
       - name: Install iOS platform support files
         run: |
-          # `xcodebuild -showsdks` always lists "iphoneos" because the iOS SDK
-          # (compile-time headers/frameworks) ships bundled inside every
-          # Xcode.app — that check tells us nothing about whether the actual
-          # device-support platform files are installed. Those live in a
-          # separate directory and are what's missing when archiving fails
-          # with "iOS <version> is not installed. To use with Xcode, first
-          # download and install the platform" even though -showsdks looks fine.
-          # Check for the real device-support directory instead.
-          PLATFORM_DIR="/Applications/Xcode_16.3.app/Contents/Developer/Platforms/iPhoneOS.platform/Library/Developer/CoreSimulator/Profiles/DeviceTypes"
-          DEVICE_SUPPORT_DIR="/Applications/Xcode_16.3.app/Contents/Developer/Platforms/iPhoneOS.platform/DeviceSupport"
-          if [ -d "$DEVICE_SUPPORT_DIR" ] && [ -n "$(ls -A "$DEVICE_SUPPORT_DIR" 2>/dev/null)" ]; then
-            echo "iOS device-support platform files already present — skipping download."
-            ls "$DEVICE_SUPPORT_DIR"
-          else
-            echo "iOS device-support platform files not found — downloading."
-            xcodebuild -downloadPlatform iOS || true
-          fi
+          echo "Ensuring iOS platform support files are installed..."
+          xcodebuild -downloadPlatform iOS
+          echo "iOS platform support files ready."
+          xcodebuild -showsdks
 
       - name: Clean workspace from previous run
         run: |

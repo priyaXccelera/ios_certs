@@ -49,24 +49,26 @@ jobs:
       # where leftovers from a previous run (project/, build/, DerivedData,
       # CocoaPods caches) could otherwise corrupt or stale-out this run.
       #
-      # `xcodebuild -downloadPlatform iOS` is unusable in this environment: it
-      # pings a simulator/device-support daemon that doesn't exist on a
-      # headless CI runner and reliably fails with exit 70 ("Unable to
-      # connect to simulator") regardless of whether the platform is actually
-      # missing — confirmed by an actual run failing this way immediately,
-      # before any real download could have happened. Do not use it here.
-      #
-      # The real issue: `setup-xcode` switches DEVELOPER_DIR to Xcode 16.3,
-      # but this image ships multiple Xcode versions side by side, and only
-      # the image's default Xcode has had its "first launch" platform/device
-      # registration run. `-runFirstLaunch` performs that registration for
-      # whichever Xcode is currently selected — no network access and no
-      # simulator daemon involved, so it doesn't hit the failure above.
+      # `-runFirstLaunch` alone registers Xcode's platform/device metadata but
+      # does NOT download a missing platform SDK — confirmed by a real run
+      # that got past `-runFirstLaunch` and all the way through 73 targets of
+      # compilation, only to fail at CompileStoryboard with "iOS 18.4 Platform
+      # Not Installed." GitHub's macOS runner image ships Xcode 16.3 without
+      # the iOS 18.4 platform bundle predownloaded, so it must be fetched with
+      # `-downloadPlatform iOS`. A prior attempt at that command failed
+      # immediately with exit 70 ("Unable to connect to simulator") — treated
+      # as unusable at the time, but not yet proven to be a hard failure vs.
+      # a transient one, since it was never retried. Retrying here to
+      # distinguish the two; if this still fails after 3 attempts, the
+      # command is confirmed unusable in this environment.
       - name: Install iOS platform support files
         run: |
-          echo "Running first-launch setup for the selected Xcode..."
           sudo xcodebuild -runFirstLaunch
-          echo "Installed SDKs:"
+          for i in 1 2 3; do
+            sudo xcodebuild -downloadPlatform iOS && break
+            echo "Retry $i failed, waiting..."
+            sleep 15
+          done
           xcodebuild -showsdks
 
       - name: Clean workspace from previous run

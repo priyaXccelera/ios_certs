@@ -49,27 +49,24 @@ jobs:
       # where leftovers from a previous run (project/, build/, DerivedData,
       # CocoaPods caches) could otherwise corrupt or stale-out this run.
       #
-      # Xcode 15+ decoupled iOS platform support (device-build metadata, the
-      # thing gym's default `generic/platform=iOS` archive destination needs)
-      # from the main Xcode.app download — it's a separate "Cryptex" package
-      # that has to be fetched with `xcodebuild -downloadPlatform iOS`. It is
-      # NOT reliably pre-installed on GitHub-hosted macos-15 runners for every
-      # Xcode point release (confirmed false for 16.3/iOS 18.4 by an actual
-      # failed run: "error: iOS 18.4 is not installed"). There is also no
-      # simple local file/dir to probe to know in advance whether it's
-      # present — `xcodebuild -showsdks` always lists iphoneos regardless
-      # (that's the compile-time SDK, a different thing), and Apple moved the
-      # real platform bundles to an internal location that isn't a stable
-      # public path to check across Xcode versions. So: just always run the
-      # download — it's a fast idempotent no-op if already installed — and do
-      # NOT swallow its exit code, so an auth/network failure here surfaces
-      # immediately with a clear message instead of a confusing failure deep
-      # inside `gym` several minutes later.
+      # `xcodebuild -downloadPlatform iOS` is unusable in this environment: it
+      # pings a simulator/device-support daemon that doesn't exist on a
+      # headless CI runner and reliably fails with exit 70 ("Unable to
+      # connect to simulator") regardless of whether the platform is actually
+      # missing — confirmed by an actual run failing this way immediately,
+      # before any real download could have happened. Do not use it here.
+      #
+      # The real issue: `setup-xcode` switches DEVELOPER_DIR to Xcode 16.3,
+      # but this image ships multiple Xcode versions side by side, and only
+      # the image's default Xcode has had its "first launch" platform/device
+      # registration run. `-runFirstLaunch` performs that registration for
+      # whichever Xcode is currently selected — no network access and no
+      # simulator daemon involved, so it doesn't hit the failure above.
       - name: Install iOS platform support files
         run: |
-          echo "Ensuring iOS platform support files are installed..."
-          xcodebuild -downloadPlatform iOS
-          echo "iOS platform support files ready."
+          echo "Running first-launch setup for the selected Xcode..."
+          sudo xcodebuild -runFirstLaunch
+          echo "Installed SDKs:"
           xcodebuild -showsdks
 
       - name: Clean workspace from previous run

@@ -1,4 +1,14 @@
 require 'digest'
+require_relative 'http_match_storage'
+
+# Registers the "http_backend" match storage_mode (see http_match_storage.rb)
+# — stores each user's certs/profiles as an encrypted blob in our own
+# backend's database instead of a shared git repo, keyed per-user via
+# JOB_ID -> user_id server-side.
+Match::Storage.register_backend(
+  type: "http_backend",
+  storage_class: Match::Storage::HttpStorage
+)
 
 default_platform(:ios)
 
@@ -107,12 +117,16 @@ platform :ios do
       # appstore type: no device registration required in the portal.
       # development type was failing with ENTITY_ERROR_RELATIONSHIP_REQUIRED
       # because Apple requires at least one registered device for dev profiles.
+      # storage_mode "http_backend" (registered above) replaces the old
+      # shared git-based cert repo — each user's certs/profiles are stored as
+      # an encrypted blob in our own backend, keyed by JOB_ID -> user_id.
+      # BACKEND_PUBLIC_URL/IPA_CALLBACK_SECRET/JOB_ID are read directly from
+      # ENV by Match::Storage::HttpStorage, not passed through here.
       match(
         type: "appstore",
         readonly: false,
         api_key: api_key,
-        git_url: ENV["MATCH_GIT_URL"],
-        git_basic_authorization: ENV["MATCH_GIT_PAT_B64"],
+        storage_mode: "http_backend",
         app_identifier: bundle_id,
         team_id: ENV["APPLE_TEAM_ID"],
         keychain_name: ENV["MATCH_KEYCHAIN_NAME"],
@@ -375,6 +389,14 @@ platform :ios do
     end
   end
 
+  # Manual-only legacy tool — unrelated to the automated per-user multi-tenant
+  # flow in build_ipa (which uses the "http_backend" storage_mode and never
+  # needs an explicit init step; match(readonly: false, ...) auto-provisions
+  # fresh certs/profiles on a new user's first build). Still targets the old
+  # shared git-based cert repo — only relevant if manually resetting that
+  # legacy shared account. Never run this against a real user's own Apple
+  # account: match_nuke revokes their existing certs first, which would
+  # silently break any other tool/CI they already use those certs with.
   desc "One-time: generate and push certs + profiles to the certificates repo"
   lane :init_match do
     cert_type = (ENV["MATCH_TYPE"] || "appstore").gsub("-", "")

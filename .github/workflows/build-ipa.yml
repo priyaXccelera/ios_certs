@@ -18,12 +18,12 @@ on:
         default: "main"
         type: string
 
-# Serialize all builds: `match` mutates the shared certs/profiles git repo
-# (MATCH_GIT_URL), which is shared across every app this builds. Concurrent
-# runs can race on cloning/pushing that repo and corrupt it, breaking
-# signing for every subsequent build until someone manually fixes it up.
+# Certs/profiles now live per-user in our own backend (see
+# fastlane/http_match_storage.rb), not one shared git repo, so builds for
+# different users/jobs no longer race on a shared resource — only guard
+# against the same job being dispatched twice concurrently.
 concurrency:
-  group: ios-build-ipa-match-certs
+  group: ios-build-ipa-${{ inputs.job_id }}
   cancel-in-progress: false
 
 jobs:
@@ -148,13 +148,17 @@ jobs:
 
           # Sanitize name for bundle ID: lowercase, alphanumeric + hyphens only
           SAFE_NAME=$(echo "$RAW_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
+          SAFE_NAME="${SAFE_NAME:-app}"
 
-          # A name made entirely of symbols/emoji sanitizes to "", which would
-          # produce an invalid bundle ID with a trailing dot (com.frontendx.).
-          # Fall back to a job-scoped name (not a fixed string) so two
-          # different empty-name apps don't collide on the same bundle ID and
-          # silently share one App Store Connect app record.
-          SAFE_NAME="${SAFE_NAME:-app-${JOB_ID:0:8}}"
+          # Always append a job-scoped suffix (deterministic per job_id, so
+          # rebuilds/retries of the SAME job keep hitting the SAME App Store
+          # Connect app record). Generated apps routinely share generic names
+          # ("Todo App", "Weather App", ...) — without this, two unrelated
+          # jobs would sanitize to the identical bundle ID, land on the same
+          # ASC app record, and TestFlight would force the second app's
+          # "first" build to build 2/3/etc. instead of build 1, since Apple
+          # sees it as another build of an existing app, not a new one.
+          SAFE_NAME="${SAFE_NAME}-${JOB_ID:0:8}"
 
           BUNDLE_ID="com.frontendx.${SAFE_NAME}"
 
@@ -189,15 +193,61 @@ jobs:
           print(f"Patched bundleIdentifier → {bundle_id}")
           EOF
 
+      # Fetch the job owner's OWN Apple Developer / App Store Connect
+      # credentials from the backend, so this build is signed and uploaded
+      # under their Apple account/team instead of one shared account.
+      # workflow_dispatch inputs (job_id/branch) are visible in the Actions
+      # UI/logs and MUST NOT carry secrets — instead this step calls a
+      # backend-internal endpoint (guarded by IPA_CALLBACK_SECRET, a static
+      # per-deployment shared secret, not a user JWT) and masks every value
+      # before exporting it to $GITHUB_ENV so later steps' logs never print it.
+      - name: Fetch Apple Developer credentials
+        if: env.SKIP_BUILD != 'true'
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          BACKEND_PUBLIC_URL: ${{ secrets.BACKEND_PUBLIC_URL }}
+          IPA_CALLBACK_SECRET: ${{ secrets.IPA_CALLBACK_SECRET }}
+        run: |
+          HTTP_CODE=$(curl -sf -o creds.json -w "%{http_code}" \
+            -H "X-Internal-Secret: $IPA_CALLBACK_SECRET" \
+            "$BACKEND_PUBLIC_URL/api/v1/jobs/internal/$JOB_ID/apple-credentials") || {
+            echo "::error::Could not fetch Apple Developer credentials from backend (curl failed)."
+            exit 1
+          }
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Backend returned $HTTP_CODE fetching Apple Developer credentials — has the job's user configured them yet?"
+            exit 1
+          fi
+
+          extract() {
+            python3 -c "import json,sys; print(json.load(open('creds.json')).get('$1') or '')"
+          }
+
+          for FIELD in apple_id apple_app_specific_password apple_team_id apple_company_name \
+                       app_store_connect_key_id app_store_connect_issuer_id \
+                       app_store_connect_api_key match_password fastlane_session; do
+            VALUE=$(extract "$FIELD")
+            if [ -n "$VALUE" ]; then
+              echo "::add-mask::$VALUE"
+            fi
+            UPPER=$(echo "$FIELD" | tr '[:lower:]' '[:upper:]')
+            {
+              echo "USER_${UPPER}<<APPLE_CRED_EOF"
+              echo "$VALUE"
+              echo "APPLE_CRED_EOF"
+            } >> "$GITHUB_ENV"
+          done
+          rm -f creds.json
+
       # Register the bundle ID via ASC REST API (idempotent).
       # App Store Connect app creation is handled by `produce` in the Fastlane
       # build_ipa lane — the REST API forbids POST /v1/apps for standard accounts.
       - name: Register bundle ID
         if: env.SKIP_BUILD != 'true'
         env:
-          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
-          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY: ${{ env.USER_APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_KEY_ID: ${{ env.USER_APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ env.USER_APP_STORE_CONNECT_ISSUER_ID }}
           APP_BUNDLE_ID: ${{ steps.appinfo.outputs.bundle_id }}
           XCODE_SCHEME: ${{ steps.appinfo.outputs.scheme }}
         run: |
@@ -349,10 +399,10 @@ jobs:
       - name: Check FASTLANE_SESSION validity
         if: env.SKIP_BUILD != 'true'
         env:
-          FASTLANE_SESSION: ${{ secrets.FASTLANE_SESSION }}
+          FASTLANE_SESSION: ${{ env.USER_FASTLANE_SESSION }}
         run: |
           if [ -z "$FASTLANE_SESSION" ]; then
-            echo "::error::FASTLANE_SESSION secret is empty. Regenerate with: fastlane spaceauth -u your@apple.id"
+            echo "::error::This user has not configured a Fastlane session. They must run 'fastlane spaceauth -u your@apple.id' and save the output in Apple Developer Settings."
             exit 1
           fi
           EXPIRY=$(echo "$FASTLANE_SESSION" | python3 -c "
@@ -380,32 +430,13 @@ jobs:
       - name: Check APPLE_APP_SPECIFIC_PASSWORD is set
         if: env.SKIP_BUILD != 'true'
         env:
-          FASTLANE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          FASTLANE_PASSWORD: ${{ env.USER_APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
           if [ -z "$FASTLANE_PASSWORD" ]; then
-            echo "::error::APPLE_APP_SPECIFIC_PASSWORD secret is empty. Generate one at appleid.apple.com → Sign-In and Security → App-Specific Passwords and store it as the APPLE_APP_SPECIFIC_PASSWORD repo secret."
+            echo "::error::This user has not configured an app-specific password. Generate one at appleid.apple.com → Sign-In and Security → App-Specific Passwords and save it in Apple Developer Settings."
             exit 1
           fi
           echo "APPLE_APP_SPECIFIC_PASSWORD is set."
-
-      # Validate MATCH_GIT_PAT_B64 decodes to 'username:PAT' — a raw PAT
-      # (missing the colon-separated username prefix) produces a git 403 that
-      # looks like a network error rather than a credentials problem.
-      - name: Check MATCH_GIT_PAT_B64 format
-        if: env.SKIP_BUILD != 'true'
-        env:
-          MATCH_GIT_PAT_B64: ${{ secrets.MATCH_GIT_PAT_B64 }}
-        run: |
-          if [ -z "$MATCH_GIT_PAT_B64" ]; then
-            echo "::error::MATCH_GIT_PAT_B64 secret is empty. Set it to base64(username:PAT) for the match certificates repo."
-            exit 1
-          fi
-          DECODED=$(echo "$MATCH_GIT_PAT_B64" | base64 --decode 2>/dev/null || true)
-          if [[ "$DECODED" != *:* ]]; then
-            echo "::error::MATCH_GIT_PAT_B64 does not decode to 'username:PAT' (no colon found). Re-encode with: echo -n 'username:ghp_...' | base64"
-            exit 1
-          fi
-          echo "MATCH_GIT_PAT_B64 format looks correct."
 
       - name: Run Fastlane build_ipa
         if: env.SKIP_BUILD != 'true'
@@ -414,23 +445,28 @@ jobs:
         # past the session check above (e.g. an unexpected 2FA challenge mid-lane).
         timeout-minutes: 45
         env:
-          MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
-          MATCH_GIT_PAT_B64: ${{ secrets.MATCH_GIT_PAT_B64 }}
-          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
-          APP_STORE_CONNECT_KEY_FILEPATH: /tmp/authkey.p8
-          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          # Read directly by Match::Storage::HttpStorage (fastlane/http_match_storage.rb)
+          # to fetch/save this user's signing bundle from our own backend —
+          # replaces the old shared MATCH_GIT_URL/MATCH_GIT_PAT_B64 cert repo.
+          BACKEND_PUBLIC_URL: ${{ secrets.BACKEND_PUBLIC_URL }}
+          IPA_CALLBACK_SECRET: ${{ secrets.IPA_CALLBACK_SECRET }}
+          JOB_ID: ${{ inputs.job_id }}
           MATCH_KEYCHAIN_NAME: "fastlane_match_keychain"
-          MATCH_KEYCHAIN_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_COMPANY_NAME: ${{ secrets.APPLE_COMPANY_NAME }}
-          FASTLANE_USER: ${{ secrets.APPLE_ID }}
-          FASTLANE_SESSION: ${{ secrets.FASTLANE_SESSION }}
-          FASTLANE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_ITC_TEAM_ID: ${{ secrets.APPLE_ITC_TEAM_ID }}
+          # Per-user Apple Developer identity — fetched from the backend by the
+          # "Fetch Apple Developer credentials" step above, masked in logs.
+          MATCH_PASSWORD: ${{ env.USER_MATCH_PASSWORD }}
+          MATCH_KEYCHAIN_PASSWORD: ${{ env.USER_MATCH_PASSWORD }}
+          APPLE_TEAM_ID: ${{ env.USER_APPLE_TEAM_ID }}
+          APP_STORE_CONNECT_API_KEY: ${{ env.USER_APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_KEY_FILEPATH: /tmp/authkey.p8
+          APP_STORE_CONNECT_ISSUER_ID: ${{ env.USER_APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ env.USER_APP_STORE_CONNECT_KEY_ID }}
+          APPLE_ID: ${{ env.USER_APPLE_ID }}
+          APPLE_COMPANY_NAME: ${{ env.USER_APPLE_COMPANY_NAME }}
+          FASTLANE_USER: ${{ env.USER_APPLE_ID }}
+          FASTLANE_SESSION: ${{ env.USER_FASTLANE_SESSION }}
+          FASTLANE_PASSWORD: ${{ env.USER_APPLE_APP_SPECIFIC_PASSWORD }}
+          FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD: ${{ env.USER_APPLE_APP_SPECIFIC_PASSWORD }}
           # Auto-derived per app — not stored as secrets
           APP_BUNDLE_ID: ${{ steps.appinfo.outputs.bundle_id }}
           XCODE_SCHEME: ${{ steps.scheme.outputs.name }}

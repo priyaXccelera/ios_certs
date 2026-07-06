@@ -1,4 +1,5 @@
 require 'digest'
+require 'match/encryption'
 require_relative 'local_match_storage'
 
 # Registers the "local_backend" match storage_mode (see local_match_storage.rb)
@@ -10,6 +11,15 @@ Match::Storage.register_backend(
   type: "local_backend",
   storage_class: Match::Storage::LocalDirStorage
 )
+
+# `match` also dispatches a SEPARATE "encryption" layer per storage_mode
+# (Match::Encryption — distinct from Match::Storage, its own registry) that
+# OpenSSL-encrypts the cert/profile files at rest in whatever storage backend
+# is used. Not needed here: SIGNING_BUNDLE_DIR's contents are already
+# protected end-to-end by the outer Fernet encryption (signing_data.enc /
+# signing_bundle.enc), so register a no-op — same as what git/s3 use for their
+# own already-encrypted-in-transit modes (google_cloud, gitlab_secure_files).
+Match::Encryption.register_backend(type: "local_backend") { |_params| nil }
 
 default_platform(:ios)
 

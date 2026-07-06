@@ -215,12 +215,15 @@ jobs:
             exit 1
           fi
 
-          # Exported before pip/python run so a failure in either doesn't also
-          # leave SIGNING_BUNDLE_DIR undefined for the later packaging step
-          # (which would otherwise crash with a confusing KeyError on top of
-          # whatever the real failure here was).
-          echo "SIGNING_BUNDLE_DIR=$RUNNER_TEMP/signing_bundle" >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/signing_bundle"
+          # `>> $GITHUB_ENV` only makes a var visible to LATER steps, not to
+          # the rest of THIS step's own shell process — the python3 heredoc
+          # below runs in this same step, so it also needs a plain `export`
+          # to actually see SIGNING_BUNDLE_DIR (the $GITHUB_ENV write is what
+          # makes it visible to the "Run Fastlane build_ipa"/"Package updated
+          # signing bundle" steps that come after this one).
+          export SIGNING_BUNDLE_DIR="$RUNNER_TEMP/signing_bundle"
+          echo "SIGNING_BUNDLE_DIR=$SIGNING_BUNDLE_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$SIGNING_BUNDLE_DIR"
 
           # macOS 26 runners ship a PEP 668 externally-managed system Python —
           # a bare `pip3 install` throws externally-managed-environment and,
@@ -250,8 +253,14 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a") as env_file:
               for field in masked_fields:
                   value = data.get(field) or ""
-                  if value:
-                      print(f"::add-mask::{value}")
+                  # GitHub's ::add-mask:: only recognizes a single-line token —
+                  # a multi-line value (e.g. the ASC API key's .p8 contents)
+                  # would otherwise only get its FIRST line masked, leaking
+                  # every subsequent line into the log in plaintext. Mask each
+                  # line of the value individually instead.
+                  for line in value.splitlines():
+                      if line:
+                          print(f"::add-mask::{line}")
                   env_file.write(f"USER_{field.upper()}<<APPLE_CRED_EOF\n{value}\nAPPLE_CRED_EOF\n")
 
           bundle_b64 = data.get("signing_bundle_base64")

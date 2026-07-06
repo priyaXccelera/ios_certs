@@ -12,6 +12,3 @@ gem "cocoapods",  "~> 1.16"
 # `require 'xcodeproj'` in the Fastfile is guaranteed to resolve even if a
 # future CocoaPods release drops or renames the dependency.
 gem "xcodeproj",  "~> 1.26"
-# Used by fastlane/http_match_storage.rb to zip/unzip the per-user signing
-# bundle (certs/profiles) fetched from our backend instead of a shared git repo.
-gem "rubyzip",    "~> 2.3", require: "zip"

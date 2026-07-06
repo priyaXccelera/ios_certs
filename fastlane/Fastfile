@@ -1,13 +1,14 @@
 require 'digest'
-require_relative 'http_match_storage'
+require_relative 'local_match_storage'
 
-# Registers the "http_backend" match storage_mode (see http_match_storage.rb)
-# — stores each user's certs/profiles as an encrypted blob in our own
-# backend's database instead of a shared git repo, keyed per-user via
-# JOB_ID -> user_id server-side.
+# Registers the "local_backend" match storage_mode (see local_match_storage.rb)
+# — `match` reads/writes the job owner's certs/profiles directly from a local
+# directory (ENV['SIGNING_BUNDLE_DIR']) that the workflow decrypts into place
+# *before* this Fastfile runs and re-uploads as a build artifact *after* —
+# zero live network calls back to our backend during the build itself.
 Match::Storage.register_backend(
-  type: "http_backend",
-  storage_class: Match::Storage::HttpStorage
+  type: "local_backend",
+  storage_class: Match::Storage::LocalDirStorage
 )
 
 default_platform(:ios)
@@ -117,16 +118,16 @@ platform :ios do
       # appstore type: no device registration required in the portal.
       # development type was failing with ENTITY_ERROR_RELATIONSHIP_REQUIRED
       # because Apple requires at least one registered device for dev profiles.
-      # storage_mode "http_backend" (registered above) replaces the old
-      # shared git-based cert repo — each user's certs/profiles are stored as
-      # an encrypted blob in our own backend, keyed by JOB_ID -> user_id.
-      # BACKEND_PUBLIC_URL/IPA_CALLBACK_SECRET/JOB_ID are read directly from
-      # ENV by Match::Storage::HttpStorage, not passed through here.
+      # storage_mode "local_backend" (registered above) replaces the old
+      # shared git-based cert repo — the workflow decrypts the job owner's
+      # certs/profiles into ENV['SIGNING_BUNDLE_DIR'] before this lane runs
+      # (no live network call), and re-uploads the (possibly updated)
+      # directory as a build artifact afterward for the backend to persist.
       match(
         type: "appstore",
         readonly: false,
         api_key: api_key,
-        storage_mode: "http_backend",
+        storage_mode: "local_backend",
         app_identifier: bundle_id,
         team_id: ENV["APPLE_TEAM_ID"],
         keychain_name: ENV["MATCH_KEYCHAIN_NAME"],

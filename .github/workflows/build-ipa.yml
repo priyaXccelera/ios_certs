@@ -106,7 +106,7 @@ jobs:
         run: |
           git fetch origin "$BUILD_BRANCH" 2>/dev/null || true
           if git ls-remote --exit-code origin "$BUILD_BRANCH" > /dev/null 2>&1; then
-            git checkout "origin/$BUILD_BRANCH" -- project.zip
+            git checkout "origin/$BUILD_BRANCH" -- project.zip signing_data.enc
           else
             echo "::warning::Branch '$BUILD_BRANCH' not found — no project.zip to extract. This is expected for a manual smoke test."
             echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
@@ -193,60 +193,70 @@ jobs:
           print(f"Patched bundleIdentifier → {bundle_id}")
           EOF
 
-      # Fetch the job owner's OWN Apple Developer / App Store Connect
-      # credentials from the backend, so this build is signed and uploaded
-      # under their Apple account/team instead of one shared account.
-      # workflow_dispatch inputs (job_id/branch) are visible in the Actions
-      # UI/logs and MUST NOT carry secrets — instead this step calls a
-      # backend-internal endpoint (guarded by IPA_CALLBACK_SECRET, a static
-      # per-deployment shared secret, not a user JWT) and masks every value
-      # before exporting it to $GITHUB_ENV so later steps' logs never print it.
-      - name: Fetch Apple Developer credentials
+      # Decrypts the job owner's OWN Apple Developer / App Store Connect
+      # credentials + any previously-stored signing bundle from
+      # signing_data.enc — pushed alongside project.zip by the backend
+      # (_push_signing_data_to_github in app/tasks.py), NOT fetched via any
+      # live call back to the backend. IPA_SIGNING_ENCRYPTION_KEY must be set
+      # identically here and as the backend's own IPA_SIGNING_ENCRYPTION_KEY
+      # env var — it's the only thing shared between the two, and it never
+      # travels over the network itself.
+      - name: Decrypt Apple Developer credentials and signing bundle
         if: env.SKIP_BUILD != 'true'
         env:
-          JOB_ID: ${{ inputs.job_id }}
-          BACKEND_PUBLIC_URL: ${{ secrets.BACKEND_PUBLIC_URL }}
-          IPA_CALLBACK_SECRET: ${{ secrets.IPA_CALLBACK_SECRET }}
+          IPA_SIGNING_ENCRYPTION_KEY: ${{ secrets.IPA_SIGNING_ENCRYPTION_KEY }}
         run: |
-          if [ -z "$BACKEND_PUBLIC_URL" ]; then
-            echo "::error::BACKEND_PUBLIC_URL secret is empty. Set it to the backend's public HTTPS URL (e.g. https://your-domain.com, no trailing slash) in this repo's Settings → Secrets and variables → Actions."
+          if [ -z "$IPA_SIGNING_ENCRYPTION_KEY" ]; then
+            echo "::error::IPA_SIGNING_ENCRYPTION_KEY secret is empty. Set it to match the backend's IPA_SIGNING_ENCRYPTION_KEY env var exactly."
             exit 1
           fi
-          if [ -z "$IPA_CALLBACK_SECRET" ]; then
-            echo "::error::IPA_CALLBACK_SECRET secret is empty. Set it to match the backend's IPA_CALLBACK_SECRET env var."
-            exit 1
-          fi
-
-          HTTP_CODE=$(curl -sf -o creds.json -w "%{http_code}" \
-            -H "X-Internal-Secret: $IPA_CALLBACK_SECRET" \
-            "$BACKEND_PUBLIC_URL/api/v1/jobs/internal/$JOB_ID/apple-credentials") || {
-            echo "::error::Could not fetch Apple Developer credentials from backend (curl failed) — check that BACKEND_PUBLIC_URL is reachable from a GitHub-hosted runner (not localhost/WSL-internal)."
-            exit 1
-          }
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::Backend returned $HTTP_CODE fetching Apple Developer credentials — has the job's user configured them yet?"
+          if [ ! -f signing_data.enc ]; then
+            echo "::error::signing_data.enc was not found on branch '${{ inputs.branch }}' — has the job's user configured Apple Developer credentials yet?"
             exit 1
           fi
 
-          extract() {
-            python3 -c "import json,sys; print(json.load(open('creds.json')).get('$1') or '')"
-          }
+          pip3 install --quiet cryptography
 
-          for FIELD in apple_id apple_app_specific_password apple_team_id apple_company_name \
-                       app_store_connect_key_id app_store_connect_issuer_id \
-                       app_store_connect_api_key match_password fastlane_session; do
-            VALUE=$(extract "$FIELD")
-            if [ -n "$VALUE" ]; then
-              echo "::add-mask::$VALUE"
-            fi
-            UPPER=$(echo "$FIELD" | tr '[:lower:]' '[:upper:]')
-            {
-              echo "USER_${UPPER}<<APPLE_CRED_EOF"
-              echo "$VALUE"
-              echo "APPLE_CRED_EOF"
-            } >> "$GITHUB_ENV"
-          done
-          rm -f creds.json
+          echo "SIGNING_BUNDLE_DIR=$RUNNER_TEMP/signing_bundle" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/signing_bundle"
+
+          python3 - <<'PYEOF'
+          import base64, hashlib, io, json, os, zipfile
+          from cryptography.fernet import Fernet
+
+          raw_key = os.environ["IPA_SIGNING_ENCRYPTION_KEY"]
+          derived_key = base64.urlsafe_b64encode(hashlib.sha256(raw_key.encode()).digest())
+          fernet = Fernet(derived_key)
+
+          with open("signing_data.enc") as f:
+              encrypted = f.read()
+          data = json.loads(fernet.decrypt(encrypted.encode()).decode())
+
+          masked_fields = [
+              "apple_id", "apple_app_specific_password", "apple_team_id",
+              "apple_company_name", "app_store_connect_key_id",
+              "app_store_connect_issuer_id", "app_store_connect_api_key",
+              "match_password", "fastlane_session",
+          ]
+          with open(os.environ["GITHUB_ENV"], "a") as env_file:
+              for field in masked_fields:
+                  value = data.get(field) or ""
+                  if value:
+                      print(f"::add-mask::{value}")
+                  env_file.write(f"USER_{field.upper()}<<APPLE_CRED_EOF\n{value}\nAPPLE_CRED_EOF\n")
+
+          bundle_b64 = data.get("signing_bundle_base64")
+          bundle_dir = os.environ["SIGNING_BUNDLE_DIR"]
+          if bundle_b64:
+              zip_bytes = base64.b64decode(bundle_b64)
+              with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                  zf.extractall(bundle_dir)
+              print("Extracted existing signing bundle into", bundle_dir)
+          else:
+              print("No existing signing bundle for this user — match will create fresh certs/profiles.")
+          PYEOF
+
+          rm -f signing_data.enc
 
       # Register the bundle ID via ASC REST API (idempotent).
       # App Store Connect app creation is handled by `produce` in the Fastlane
@@ -454,15 +464,13 @@ jobs:
         # past the session check above (e.g. an unexpected 2FA challenge mid-lane).
         timeout-minutes: 45
         env:
-          # Read directly by Match::Storage::HttpStorage (fastlane/http_match_storage.rb)
-          # to fetch/save this user's signing bundle from our own backend —
-          # replaces the old shared MATCH_GIT_URL/MATCH_GIT_PAT_B64 cert repo.
-          BACKEND_PUBLIC_URL: ${{ secrets.BACKEND_PUBLIC_URL }}
-          IPA_CALLBACK_SECRET: ${{ secrets.IPA_CALLBACK_SECRET }}
-          JOB_ID: ${{ inputs.job_id }}
+          # SIGNING_BUNDLE_DIR is already ambient from the "Decrypt Apple
+          # Developer credentials and signing bundle" step above (exported
+          # via $GITHUB_ENV) — Match::Storage::LocalDirStorage reads it
+          # directly, no HTTP/network calls to our backend at all.
           MATCH_KEYCHAIN_NAME: "fastlane_match_keychain"
-          # Per-user Apple Developer identity — fetched from the backend by the
-          # "Fetch Apple Developer credentials" step above, masked in logs.
+          # Per-user Apple Developer identity — decrypted locally from
+          # signing_data.enc by the step above, masked in logs.
           MATCH_PASSWORD: ${{ env.USER_MATCH_PASSWORD }}
           MATCH_KEYCHAIN_PASSWORD: ${{ env.USER_MATCH_PASSWORD }}
           APPLE_TEAM_ID: ${{ env.USER_APPLE_TEAM_ID }}
@@ -482,6 +490,50 @@ jobs:
         run: |
           printf '%s' "$APP_STORE_CONNECT_API_KEY" > /tmp/authkey.p8
           bundle exec fastlane ios build_ipa
+
+      # Re-zips+encrypts SIGNING_BUNDLE_DIR (possibly containing new/renewed
+      # certs `match` just created) and uploads it as a build artifact so
+      # poll_ipa_build_task can pull it back and persist it for this user's
+      # NEXT build — otherwise every build would recreate certs from
+      # scratch and quickly hit Apple's 2-distribution-cert-per-team limit.
+      # Runs even if the Fastlane step itself failed partway through (e.g.
+      # after match already created a cert but gym/upload later failed) so
+      # that work isn't silently lost.
+      - name: Package updated signing bundle
+        if: always() && env.SKIP_BUILD != 'true'
+        env:
+          IPA_SIGNING_ENCRYPTION_KEY: ${{ secrets.IPA_SIGNING_ENCRYPTION_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import base64, hashlib, io, json, os, zipfile
+          from cryptography.fernet import Fernet
+
+          bundle_dir = os.environ["SIGNING_BUNDLE_DIR"]
+          buf = io.BytesIO()
+          with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, _dirs, files in os.walk(bundle_dir):
+                  for name in files:
+                      path = os.path.join(root, name)
+                      zf.write(path, os.path.relpath(path, bundle_dir))
+          bundle_b64 = base64.b64encode(buf.getvalue()).decode()
+
+          raw_key = os.environ["IPA_SIGNING_ENCRYPTION_KEY"]
+          derived_key = base64.urlsafe_b64encode(hashlib.sha256(raw_key.encode()).digest())
+          fernet = Fernet(derived_key)
+          encrypted = fernet.encrypt(json.dumps({"signing_bundle_base64": bundle_b64}).encode()).decode()
+
+          with open("signing_bundle.enc", "w") as f:
+              f.write(encrypted)
+          PYEOF
+
+      - name: Upload updated signing bundle artifact
+        if: always() && env.SKIP_BUILD != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-bundle-${{ inputs.job_id }}
+          path: signing_bundle.enc
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Upload IPA artifact
         id: upload_artifact

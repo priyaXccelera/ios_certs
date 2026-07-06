@@ -1,5 +1,23 @@
 require 'fileutils'
+require 'match/module'
 require 'match/storage'
+
+# `Match::Storage.register_backend` (used below) only extends the internal
+# dispatch table (Match::Storage.backends) that `Match::Storage.from_params`
+# consults. It does NOT touch the fastlane `match` ACTION's own separate,
+# hardcoded validation of the `storage_mode:` option — that lives in
+# match/lib/match/options.rb's `storage_mode` ConfigItem, whose verify_block
+# checks `Match.storage_modes.include?(value)` against the fixed array
+# defined in match/lib/match/module.rb (%w(git google_cloud s3
+# gitlab_secure_files)). Without also patching that list, `match(storage_mode:
+# "local_backend", ...)` fails validation before ever reaching our registered
+# backend, with "Unsupported storage_mode local_backend, must be in git,
+# google_cloud, s3, gitlab_secure_files".
+module Match
+  def self.storage_modes
+    return %w(git google_cloud s3 gitlab_secure_files local_backend)
+  end
+end
 
 # `match` storage backend that just points at a pre-populated local
 # directory instead of a remote repo/bucket. The workflow (build-ipa.yml)

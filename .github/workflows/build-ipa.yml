@@ -215,10 +215,19 @@ jobs:
             exit 1
           fi
 
-          pip3 install --quiet cryptography
-
+          # Exported before pip/python run so a failure in either doesn't also
+          # leave SIGNING_BUNDLE_DIR undefined for the later packaging step
+          # (which would otherwise crash with a confusing KeyError on top of
+          # whatever the real failure here was).
           echo "SIGNING_BUNDLE_DIR=$RUNNER_TEMP/signing_bundle" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/signing_bundle"
+
+          # macOS 26 runners ship a PEP 668 externally-managed system Python —
+          # a bare `pip3 install` throws externally-managed-environment and,
+          # since GitHub Actions runs steps under `bash -e`, aborts this step
+          # immediately. --break-system-packages is safe here: this is a
+          # short-lived CI runner VM, not a shared/persistent system.
+          pip3 install --quiet --break-system-packages cryptography
 
           python3 - <<'PYEOF'
           import base64, hashlib, io, json, os, zipfile

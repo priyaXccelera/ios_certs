@@ -208,10 +208,19 @@ jobs:
           BACKEND_PUBLIC_URL: ${{ secrets.BACKEND_PUBLIC_URL }}
           IPA_CALLBACK_SECRET: ${{ secrets.IPA_CALLBACK_SECRET }}
         run: |
+          if [ -z "$BACKEND_PUBLIC_URL" ]; then
+            echo "::error::BACKEND_PUBLIC_URL secret is empty. Set it to the backend's public HTTPS URL (e.g. https://your-domain.com, no trailing slash) in this repo's Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          if [ -z "$IPA_CALLBACK_SECRET" ]; then
+            echo "::error::IPA_CALLBACK_SECRET secret is empty. Set it to match the backend's IPA_CALLBACK_SECRET env var."
+            exit 1
+          fi
+
           HTTP_CODE=$(curl -sf -o creds.json -w "%{http_code}" \
             -H "X-Internal-Secret: $IPA_CALLBACK_SECRET" \
             "$BACKEND_PUBLIC_URL/api/v1/jobs/internal/$JOB_ID/apple-credentials") || {
-            echo "::error::Could not fetch Apple Developer credentials from backend (curl failed)."
+            echo "::error::Could not fetch Apple Developer credentials from backend (curl failed) — check that BACKEND_PUBLIC_URL is reachable from a GitHub-hosted runner (not localhost/WSL-internal)."
             exit 1
           }
           if [ "$HTTP_CODE" != "200" ]; then

@@ -5,7 +5,7 @@ require 'base64'
 require 'tmpdir'
 require 'fileutils'
 require 'zip'
-require 'match/storage/interface'
+require 'match/storage'
 
 # Stores the `match`-managed certs/profiles as one encrypted blob per user in
 # our own backend's database, instead of a shared git repo. Each user's

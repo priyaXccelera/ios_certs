@@ -1,4 +1,3 @@
-require 'digest'
 require 'match/encryption'
 require_relative 'local_match_storage'
 
@@ -103,14 +102,14 @@ platform :ios do
         # App Store *display names* are unique across ALL Apple developer
         # accounts worldwide (unlike bundle IDs, which are effectively
         # namespaced here by the "com.frontendx." prefix) — generic generated
-        # names like "Todo App" or "Weather App" routinely collide with an
-        # existing app from a different account. Append a short suffix
-        # derived from the bundle ID to dodge that, deterministically (not
-        # random) so retrying produce for the same bundle ID keeps producing
-        # the same name instead of registering a new one each attempt.
-        name_suffix = Digest::SHA256.hexdigest(bundle_id)[0, 6]
-        base_name = bundle_id.split('.').last.gsub('-', ' ').split.map(&:capitalize).join(' ')[0, 22]
-        safe_display_name = "#{base_name} #{name_suffix}"[0, 30]
+        # names like "Todo App" or "Weather App" can collide with an existing
+        # app from a different account. We intentionally do NOT auto-mangle
+        # the name with a random/hash suffix here — the user picks the app
+        # name up front, and if `produce` rejects it as taken, that failure
+        # is surfaced back through the backend (see _IPA_FAILURE_SIGNATURES
+        # in app/tasks.py) so the user can choose a different name, rather
+        # than silently registering under a name they never asked for.
+        safe_display_name = scheme[0, 30]
         sku = bundle_id.gsub('.', '-')[0, 50]
         produce(
           username:       ENV["APPLE_ID"],

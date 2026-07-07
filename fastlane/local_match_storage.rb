@@ -52,6 +52,8 @@ module Match
         return if @working_directory
 
         self.working_directory = bundle_dir
+        existing = Dir.glob(File.join(bundle_dir, "**", "*")).select { |f| File.file?(f) }
+        UI.message("[local_match_storage] download: working_directory=#{bundle_dir}, #{existing.length} existing file(s): #{existing.join(', ')}")
       end
 
       def human_readable_description
@@ -63,9 +65,11 @@ module Match
       # the workflow's own "package updated signing bundle" step zips and
       # uploads that same directory as a build artifact after Fastlane runs.
       def upload_files(files_to_upload: [], custom_message: nil)
+        UI.message("[local_match_storage] upload_files called with #{files_to_upload.length} file(s): #{files_to_upload.join(', ')}")
       end
 
       def delete_files(files_to_delete: [], custom_message: nil)
+        UI.message("[local_match_storage] delete_files called with #{files_to_delete.length} file(s): #{files_to_delete.join(', ')}")
       end
 
       def skip_docs

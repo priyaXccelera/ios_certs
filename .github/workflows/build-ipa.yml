@@ -537,6 +537,9 @@ jobs:
         env:
           IPA_SIGNING_ENCRYPTION_KEY: ${{ secrets.IPA_SIGNING_ENCRYPTION_KEY }}
         run: |
+          echo "SIGNING_BUNDLE_DIR contents before packaging:"
+          find "$SIGNING_BUNDLE_DIR" -type f -exec ls -la {} \; || echo "(SIGNING_BUNDLE_DIR not found or empty)"
+
           python3 - <<'PYEOF'
           import base64, hashlib, io, json, os, zipfile
           from cryptography.fernet import Fernet

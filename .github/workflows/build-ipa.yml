@@ -161,25 +161,23 @@ jobs:
           print(name)
           ")
 
-          # Sanitize name for bundle ID: lowercase, alphanumeric + hyphens only
-          SAFE_NAME=$(echo "$RAW_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
-          SAFE_NAME="${SAFE_NAME:-app}"
-
-          # Always append a job-scoped suffix (deterministic per job_id, so
-          # rebuilds/retries of the SAME job keep hitting the SAME App Store
-          # Connect app record). Generated apps routinely share generic names
-          # ("Todo App", "Weather App", ...) — without this, two unrelated
-          # jobs would sanitize to the identical bundle ID, land on the same
-          # ASC app record, and TestFlight would force the second app's
-          # "first" build to build 2/3/etc. instead of build 1, since Apple
-          # sees it as another build of an existing app, not a new one.
-          SAFE_NAME="${SAFE_NAME}-${JOB_ID:0:8}"
-
-          BUNDLE_ID="com.frontendx.${SAFE_NAME}"
+          # Bundle ID is derived ONLY from job_id — never from the app's
+          # current display name. A job's GenerationJob id stays fixed across
+          # its whole lifetime (initial generation, restarts, and every
+          # "Modify App" accept), so this keeps hitting the SAME bundle ID /
+          # App Store Connect app / TestFlight app across modifications. It
+          # used to also fold in a sanitized copy of the app name so two
+          # unrelated jobs with the same generic name ("Todo App") wouldn't
+          # collide — but since a *rename* mid-modify changed that sanitized
+          # name, it silently produced a brand-new bundle ID (and thus a
+          # brand-new TestFlight app) instead of just adding a new build to
+          # the existing one. job_id alone (a UUID) is already
+          # globally unique, so the name was never needed for uniqueness.
+          SAFE_JOB_ID=$(echo "$JOB_ID" | tr -cd 'a-z0-9-')
+          BUNDLE_ID="com.frontendx.job-${SAFE_JOB_ID}"
 
           echo "bundle_id=$BUNDLE_ID"   >> "$GITHUB_OUTPUT"
           echo "scheme=$RAW_NAME"       >> "$GITHUB_OUTPUT"
-          echo "safe_name=$SAFE_NAME"   >> "$GITHUB_OUTPUT"
 
           echo "Derived bundle ID : $BUNDLE_ID"
           echo "Derived scheme    : $RAW_NAME"

@@ -23,6 +23,96 @@ Match::Encryption.register_backend(type: "local_backend") { |_params| nil }
 default_platform(:ios)
 
 platform :ios do
+  # Shared by both `build_ipa` and the standalone `create_app` lane (used by
+  # create-appstore-app.yml, dispatched before source generation) — creates
+  # the App Store Connect app record for `bundle_id` if it doesn't already
+  # exist. Idempotent: a re-run against an already-provisioned bundle ID
+  # (e.g. build_ipa running after create_app already succeeded) just skips
+  # straight through via the existing_app lookup below.
+  private_lane :register_appstore_app do |options|
+    bundle_id = options[:bundle_id]
+    app_name  = options[:app_name]
+
+    # Look up whether an App Store Connect app record already exists for
+    # this bundle ID — e.g. a previous run got this far and created it
+    # before failing later in the pipeline. This lookup works with the
+    # API key (only POST /v1/apps for *creating* an app is blocked for
+    # standard accounts, GET is not), so it never needs Apple ID web auth.
+    # Skipping produce when the app already exists also means a re-run of
+    # an already-provisioned app no longer depends on a valid Apple ID
+    # session/2FA at all.
+    # Spaceship::ConnectAPI::App.find can raise (rate limit, invalid key,
+    # network error) instead of returning nil. Treat any exception as
+    # "app not found" and fall through to produce — if produce also fails,
+    # the real error surfaces there with a clearer message.
+    existing_app = begin
+      Spaceship::ConnectAPI::App.find(bundle_id)
+    rescue => spaceship_err
+      UI.important("ASC API lookup raised #{spaceship_err.class}: #{spaceship_err.message} — assuming app does not exist yet, falling through to produce.")
+      nil
+    end
+
+    if existing_app
+      UI.message("App Store Connect app already exists for #{bundle_id} (id: #{existing_app.id}) — skipping produce.")
+    else
+      # produce uses Apple ID + app-specific password (Spaceship web auth)
+      # because the ASC REST API forbids POST /v1/apps for standard accounts.
+      #
+      # App Store *display names* are unique across ALL Apple developer
+      # accounts worldwide (unlike bundle IDs, which are effectively
+      # namespaced here by the "com.frontendx." prefix) — generic generated
+      # names like "Todo App" or "Weather App" can collide with an existing
+      # app from a different account. We intentionally do NOT auto-mangle
+      # the name with a random/hash suffix here — the user picks the app
+      # name up front, and if `produce` rejects it as taken, that failure
+      # is surfaced back through the backend (see _IPA_FAILURE_SIGNATURES
+      # in app/tasks.py) so the user can choose a different name, rather
+      # than silently registering under a name they never asked for.
+      safe_display_name = app_name[0, 30]
+      sku = bundle_id.gsub('.', '-')[0, 50]
+      begin
+        produce(
+          username:       ENV["APPLE_ID"],
+          app_identifier: bundle_id,
+          app_name:       safe_display_name,
+          company_name:   ENV["APPLE_COMPANY_NAME"],
+          language:       "English",
+          app_version:    "1.0",
+          sku:            sku,
+          team_id:        ENV["APPLE_TEAM_ID"],
+          itc_team_id:    ENV["APPLE_ITC_TEAM_ID"] || ENV["APPLE_TEAM_ID"],
+        )
+      rescue => produce_err
+        # Apple's actual wording for a taken display name has drifted across
+        # API versions ("The app name you entered is already being used",
+        # "Name is already taken", "App Name is not available", etc.) — the
+        # backend's _IPA_FAILURE_SIGNATURES guessed at these exact strings,
+        # which silently broke whenever Apple changed the wording and let
+        # the run fall through to an unrelated, misleading signature (e.g.
+        # the generic FASTLANE_SESSION one, which matches on the *step
+        # name* that appears in every run's logs regardless of outcome).
+        # Emit one deterministic, wording-independent marker instead, so the
+        # backend only has to match a literal string we control ourselves.
+        if produce_err.message =~ /name.{0,40}(already|taken|not available|in use)/i || produce_err.message =~ /(already|taken).{0,40}name/i
+          UI.error("::error::APP_NAME_TAKEN: #{produce_err.message}")
+        end
+        raise produce_err
+      end
+    end
+  end
+
+  desc "Create/register the ASC app + bundle ID for a job BEFORE any source is generated. No macOS/Xcode dependency — plain API/Spaceship calls only."
+  lane :create_app do
+    app_store_connect_api_key(
+      key_id: ENV["APP_STORE_CONNECT_KEY_ID"],
+      issuer_id: ENV["APP_STORE_CONNECT_ISSUER_ID"],
+      key_filepath: ENV["APP_STORE_CONNECT_KEY_FILEPATH"],
+      in_house: false,
+    )
+
+    register_appstore_app(bundle_id: ENV["APP_BUNDLE_ID"], app_name: ENV["APP_NAME"])
+  end
+
   desc "Build and upload to TestFlight. Bundle ID and scheme are auto-derived per app."
   lane :build_ipa do
     # Fastlane itself runs with Dir.pwd set to this Fastfile's own directory
@@ -74,72 +164,7 @@ platform :ios do
     sh("security unlock-keychain -p '#{ENV["MATCH_KEYCHAIN_PASSWORD"]}' '#{keychain_path}'")
 
     begin
-      # Look up whether an App Store Connect app record already exists for
-      # this bundle ID — e.g. a previous run got this far and created it
-      # before failing later in the pipeline. This lookup works with the
-      # API key (only POST /v1/apps for *creating* an app is blocked for
-      # standard accounts, GET is not), so it never needs Apple ID web auth.
-      # Skipping produce when the app already exists also means a re-run of
-      # an already-provisioned app no longer depends on a valid Apple ID
-      # session/2FA at all.
-      # Spaceship::ConnectAPI::App.find can raise (rate limit, invalid key,
-      # network error) instead of returning nil. Treat any exception as
-      # "app not found" and fall through to produce — if produce also fails,
-      # the real error surfaces there with a clearer message.
-      existing_app = begin
-        Spaceship::ConnectAPI::App.find(bundle_id)
-      rescue => spaceship_err
-        UI.important("ASC API lookup raised #{spaceship_err.class}: #{spaceship_err.message} — assuming app does not exist yet, falling through to produce.")
-        nil
-      end
-
-      if existing_app
-        UI.message("App Store Connect app already exists for #{bundle_id} (id: #{existing_app.id}) — skipping produce.")
-      else
-        # produce uses Apple ID + app-specific password (Spaceship web auth)
-        # because the ASC REST API forbids POST /v1/apps for standard accounts.
-        #
-        # App Store *display names* are unique across ALL Apple developer
-        # accounts worldwide (unlike bundle IDs, which are effectively
-        # namespaced here by the "com.frontendx." prefix) — generic generated
-        # names like "Todo App" or "Weather App" can collide with an existing
-        # app from a different account. We intentionally do NOT auto-mangle
-        # the name with a random/hash suffix here — the user picks the app
-        # name up front, and if `produce` rejects it as taken, that failure
-        # is surfaced back through the backend (see _IPA_FAILURE_SIGNATURES
-        # in app/tasks.py) so the user can choose a different name, rather
-        # than silently registering under a name they never asked for.
-        safe_display_name = scheme[0, 30]
-        sku = bundle_id.gsub('.', '-')[0, 50]
-        begin
-          produce(
-            username:       ENV["APPLE_ID"],
-            app_identifier: bundle_id,
-            app_name:       safe_display_name,
-            company_name:   ENV["APPLE_COMPANY_NAME"],
-            language:       "English",
-            app_version:    "1.0",
-            sku:            sku,
-            team_id:        ENV["APPLE_TEAM_ID"],
-            itc_team_id:    ENV["APPLE_ITC_TEAM_ID"] || ENV["APPLE_TEAM_ID"],
-          )
-        rescue => produce_err
-          # Apple's actual wording for a taken display name has drifted across
-          # API versions ("The app name you entered is already being used",
-          # "Name is already taken", "App Name is not available", etc.) — the
-          # backend's _IPA_FAILURE_SIGNATURES guessed at these exact strings,
-          # which silently broke whenever Apple changed the wording and let
-          # the run fall through to an unrelated, misleading signature (e.g.
-          # the generic FASTLANE_SESSION one, which matches on the *step
-          # name* that appears in every run's logs regardless of outcome).
-          # Emit one deterministic, wording-independent marker instead, so the
-          # backend only has to match a literal string we control ourselves.
-          if produce_err.message =~ /name.{0,40}(already|taken|not available|in use)/i || produce_err.message =~ /(already|taken).{0,40}name/i
-            UI.error("::error::APP_NAME_TAKEN: #{produce_err.message}")
-          end
-          raise produce_err
-        end
-      end
+      register_appstore_app(bundle_id: bundle_id, app_name: scheme)
 
       # appstore type: no device registration required in the portal.
       # development type was failing with ENTITY_ERROR_RELATIONSHIP_REQUIRED

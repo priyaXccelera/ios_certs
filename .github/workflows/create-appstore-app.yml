@@ -1,0 +1,221 @@
+name: Create App Store Connect App
+
+# Lightweight companion to build-ipa.yml — registers the bundle ID and
+# creates the App Store Connect app record for a job BEFORE source
+# generation runs, so a name collision or an expired Fastlane session
+# surfaces immediately instead of after a full generation pipeline run.
+# Deliberately runs on ubuntu-latest: `produce`'s app-creation call goes
+# through Fastlane's Spaceship library (Apple ID web auth), not Xcode, so no
+# macOS/iOS platform tooling is needed here at all — this finishes in
+# seconds, not the 20-45 minutes build-ipa.yml takes.
+run-name: "create-appstore-app-${{ inputs.job_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "FrontendX job UUID"
+        required: true
+        type: string
+      branch:
+        description: "Branch containing signing_data.enc"
+        required: true
+        type: string
+      app_name:
+        description: "Requested App Store display name (not a secret)"
+        required: true
+        type: string
+      bundle_id:
+        description: "Bundle ID, derived by the backend from job_id (not a secret)"
+        required: true
+        type: string
+
+concurrency:
+  group: create-appstore-app-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  create-app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Clean workspace from previous run
+        run: rm -rf project.zip signing_data.enc
+
+      # Always check out main so the workflow uses the latest Fastfile/Gemfile.
+      - name: Checkout ipa-builder repo (main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Fetch signing_data.enc from build branch
+        env:
+          BUILD_BRANCH: ${{ inputs.branch }}
+        run: |
+          git fetch origin "$BUILD_BRANCH" 2>/dev/null || true
+          git checkout "origin/$BUILD_BRANCH" -- signing_data.enc
+
+      # Same decrypt logic as build-ipa.yml's equivalent step, minus the
+      # signing-bundle extraction (no `match`/certs involved in this workflow
+      # at all — only Apple ID + ASC API key credentials are needed).
+      - name: Decrypt Apple Developer credentials
+        env:
+          IPA_SIGNING_ENCRYPTION_KEY: ${{ secrets.IPA_SIGNING_ENCRYPTION_KEY }}
+        run: |
+          if [ -z "$IPA_SIGNING_ENCRYPTION_KEY" ]; then
+            echo "::error::IPA_SIGNING_ENCRYPTION_KEY secret is empty. Set it to match the backend's IPA_SIGNING_ENCRYPTION_KEY env var exactly."
+            exit 1
+          fi
+          if [ ! -f signing_data.enc ]; then
+            echo "::error::signing_data.enc was not found on branch '${{ inputs.branch }}' — has the job's user configured Apple Developer credentials yet?"
+            exit 1
+          fi
+
+          pip3 install --quiet --break-system-packages cryptography
+
+          python3 - <<'PYEOF'
+          import base64, hashlib, json, os
+          from cryptography.fernet import Fernet
+
+          raw_key = os.environ["IPA_SIGNING_ENCRYPTION_KEY"]
+          derived_key = base64.urlsafe_b64encode(hashlib.sha256(raw_key.encode()).digest())
+          fernet = Fernet(derived_key)
+
+          with open("signing_data.enc") as f:
+              encrypted = f.read()
+          data = json.loads(fernet.decrypt(encrypted.encode()).decode())
+
+          masked_fields = [
+              "apple_id", "apple_app_specific_password", "apple_team_id",
+              "apple_company_name", "app_store_connect_key_id",
+              "app_store_connect_issuer_id", "app_store_connect_api_key",
+              "fastlane_session",
+          ]
+          with open(os.environ["GITHUB_ENV"], "a") as env_file:
+              for field in masked_fields:
+                  value = data.get(field) or ""
+                  for line in value.splitlines():
+                      if line:
+                          print(f"::add-mask::{line}")
+                  env_file.write(f"USER_{field.upper()}<<APPLE_CRED_EOF\n{value}\nAPPLE_CRED_EOF\n")
+          PYEOF
+
+          rm -f signing_data.enc
+
+      # Register bundle ID via ASC REST API (idempotent — 409 means already
+      # exists). Identical script to build-ipa.yml's "Register bundle ID" step.
+      - name: Register bundle ID
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ env.USER_APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_KEY_ID: ${{ env.USER_APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ env.USER_APP_STORE_CONNECT_ISSUER_ID }}
+          APP_BUNDLE_ID: ${{ inputs.bundle_id }}
+          XCODE_SCHEME: ${{ inputs.app_name }}
+        run: |
+          ruby - <<'RUBY'
+          require 'openssl'
+          require 'base64'
+          require 'json'
+          require 'net/http'
+          require 'uri'
+          require 'time'
+
+          key_id    = ENV['APP_STORE_CONNECT_KEY_ID']
+          issuer_id = ENV['APP_STORE_CONNECT_ISSUER_ID']
+          bundle_id = ENV['APP_BUNDLE_ID']
+          app_name  = ENV['XCODE_SCHEME']
+
+          private_key = OpenSSL::PKey::EC.new(ENV['APP_STORE_CONNECT_API_KEY'])
+
+          def make_jwt(private_key, key_id, issuer_id)
+            header  = Base64.urlsafe_encode64({ alg: 'ES256', kid: key_id, typ: 'JWT' }.to_json).tr('=', '')
+            now     = Time.now.to_i
+            payload = Base64.urlsafe_encode64({ iss: issuer_id, iat: now, exp: now + 1200, aud: 'appstoreconnect-v1' }.to_json).tr('=', '')
+            signing_input = "#{header}.#{payload}"
+            der = private_key.sign(OpenSSL::Digest::SHA256.new, signing_input)
+            asn = OpenSSL::ASN1.decode(der)
+            r   = asn.value[0].value.to_s(2).rjust(32, "\x00")[-32..]
+            s   = asn.value[1].value.to_s(2).rjust(32, "\x00")[-32..]
+            "#{signing_input}.#{Base64.urlsafe_encode64(r + s).tr('=', '')}"
+          end
+
+          http = Net::HTTP.new('api.appstoreconnect.apple.com', 443)
+          http.use_ssl = true
+
+          def headers(token)
+            { 'Authorization' => "Bearer #{token}", 'Content-Type' => 'application/json' }
+          end
+
+          token = make_jwt(private_key, key_id, issuer_id)
+          req = Net::HTTP::Post.new('/v1/bundleIds', headers(token))
+          req.body = {
+            data: {
+              type: 'bundleIds',
+              attributes: { identifier: bundle_id, name: app_name, platform: 'IOS' }
+            }
+          }.to_json
+          resp = http.request(req)
+          if resp.code == '409'
+            puts "Bundle ID #{bundle_id} already registered."
+          elsif resp.code.start_with?('2')
+            puts "Registered bundle ID #{bundle_id}."
+          else
+            puts "ERROR registering bundle ID (#{resp.code}): #{resp.body}"
+            exit 1
+          end
+          RUBY
+
+      - name: Fast-fail if FASTLANE_SESSION is missing or expired
+        env:
+          FASTLANE_SESSION: ${{ env.USER_FASTLANE_SESSION }}
+        run: |
+          if [ -z "$FASTLANE_SESSION" ]; then
+            echo "::error::This user has not configured a Fastlane session. They must run 'fastlane spaceauth -u your@apple.id' and save the output in Apple Developer Settings."
+            exit 1
+          fi
+          EXPIRY=$(echo "$FASTLANE_SESSION" | python3 -c "
+          import sys, re
+          content = sys.stdin.read()
+          match = re.search(r'expires:\s*(\d{4}-\d{2}-\d{2})', content)
+          print(match.group(1) if match else 'unknown')
+          ")
+          if [ "$EXPIRY" != "unknown" ]; then
+            TODAY=$(date -u +%Y-%m-%d)
+            if [[ "$EXPIRY" < "$TODAY" ]]; then
+              echo "::error::FASTLANE_SESSION expired on $EXPIRY (today is $TODAY). Regenerate with: fastlane spaceauth -u your@apple.id"
+              exit 1
+            fi
+          fi
+
+      - name: Setup Ruby + Bundler
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: false
+
+      - name: Install gems
+        run: |
+          bundle config set frozen false
+          bundle install --jobs 4 --retry 3
+
+      - name: Run Fastlane create_app
+        timeout-minutes: 10
+        env:
+          APPLE_TEAM_ID: ${{ env.USER_APPLE_TEAM_ID }}
+          APP_STORE_CONNECT_API_KEY: ${{ env.USER_APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_KEY_FILEPATH: /tmp/authkey.p8
+          APP_STORE_CONNECT_ISSUER_ID: ${{ env.USER_APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ env.USER_APP_STORE_CONNECT_KEY_ID }}
+          APPLE_ID: ${{ env.USER_APPLE_ID }}
+          APPLE_COMPANY_NAME: ${{ env.USER_APPLE_COMPANY_NAME }}
+          FASTLANE_USER: ${{ env.USER_APPLE_ID }}
+          FASTLANE_SESSION: ${{ env.USER_FASTLANE_SESSION }}
+          FASTLANE_PASSWORD: ${{ env.USER_APPLE_APP_SPECIFIC_PASSWORD }}
+          FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD: ${{ env.USER_APPLE_APP_SPECIFIC_PASSWORD }}
+          APP_BUNDLE_ID: ${{ inputs.bundle_id }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          printf '%s' "$APP_STORE_CONNECT_API_KEY" > /tmp/authkey.p8
+          bundle exec fastlane ios create_app

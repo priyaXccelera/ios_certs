@@ -111,17 +111,34 @@ platform :ios do
         # than silently registering under a name they never asked for.
         safe_display_name = scheme[0, 30]
         sku = bundle_id.gsub('.', '-')[0, 50]
-        produce(
-          username:       ENV["APPLE_ID"],
-          app_identifier: bundle_id,
-          app_name:       safe_display_name,
-          company_name:   ENV["APPLE_COMPANY_NAME"],
-          language:       "English",
-          app_version:    "1.0",
-          sku:            sku,
-          team_id:        ENV["APPLE_TEAM_ID"],
-          itc_team_id:    ENV["APPLE_ITC_TEAM_ID"] || ENV["APPLE_TEAM_ID"],
-        )
+        begin
+          produce(
+            username:       ENV["APPLE_ID"],
+            app_identifier: bundle_id,
+            app_name:       safe_display_name,
+            company_name:   ENV["APPLE_COMPANY_NAME"],
+            language:       "English",
+            app_version:    "1.0",
+            sku:            sku,
+            team_id:        ENV["APPLE_TEAM_ID"],
+            itc_team_id:    ENV["APPLE_ITC_TEAM_ID"] || ENV["APPLE_TEAM_ID"],
+          )
+        rescue => produce_err
+          # Apple's actual wording for a taken display name has drifted across
+          # API versions ("The app name you entered is already being used",
+          # "Name is already taken", "App Name is not available", etc.) — the
+          # backend's _IPA_FAILURE_SIGNATURES guessed at these exact strings,
+          # which silently broke whenever Apple changed the wording and let
+          # the run fall through to an unrelated, misleading signature (e.g.
+          # the generic FASTLANE_SESSION one, which matches on the *step
+          # name* that appears in every run's logs regardless of outcome).
+          # Emit one deterministic, wording-independent marker instead, so the
+          # backend only has to match a literal string we control ourselves.
+          if produce_err.message =~ /name.{0,40}(already|taken|not available|in use)/i || produce_err.message =~ /(already|taken).{0,40}name/i
+            UI.error("::error::APP_NAME_TAKEN: #{produce_err.message}")
+          end
+          raise produce_err
+        end
       end
 
       # appstore type: no device registration required in the portal.

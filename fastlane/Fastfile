@@ -70,7 +70,22 @@ platform :ios do
       # than silently registering under a name they never asked for.
       safe_display_name = app_name[0, 30]
       sku = bundle_id.gsub('.', '-')[0, 50]
+
+      # Apple's App Store Connect backend intermittently 500s while creating
+      # a NEW app record specifically (confirmed transient — fastlane/fastlane
+      # #21199 tracks this exact "Server error got 500" message; our own runs
+      # have shown produce get as far as "Creating new app ... on App Store
+      # Connect" / "Ensuring version number" before Apple's server errors
+      # out). Retry a few times with backoff rather than failing the whole
+      # job on what a second attempt usually resolves on its own. If Apple
+      # did partially create the app before the 500, the next attempt's own
+      # existing_app lookup (via Spaceship::ConnectAPI::App.find, re-run
+      # fresh each retry) finds it and skips produce entirely — so a retry
+      # here can never double-create the app.
+      max_attempts = 3
+      attempt = 0
       begin
+        attempt += 1
         produce(
           username:       ENV["APPLE_ID"],
           app_identifier: bundle_id,
@@ -95,7 +110,16 @@ platform :ios do
         # backend only has to match a literal string we control ourselves.
         if produce_err.message =~ /name.{0,40}(already|taken|not available|in use)/i || produce_err.message =~ /(already|taken).{0,40}name/i
           UI.error("::error::APP_NAME_TAKEN: #{produce_err.message}")
+          raise produce_err
         end
+
+        if produce_err.message =~ /Server error got 5\d\d/i && attempt < max_attempts
+          wait_seconds = attempt * 20
+          UI.important("produce hit a transient Apple server error (attempt #{attempt}/#{max_attempts}) — retrying in #{wait_seconds}s: #{produce_err.message}")
+          sleep(wait_seconds)
+          retry
+        end
+
         raise produce_err
       end
     end

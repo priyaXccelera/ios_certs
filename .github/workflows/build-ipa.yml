@@ -234,7 +234,17 @@ jobs:
           # to actually see SIGNING_BUNDLE_DIR (the $GITHUB_ENV write is what
           # makes it visible to the "Run Fastlane build_ipa"/"Package updated
           # signing bundle" steps that come after this one).
-          export SIGNING_BUNDLE_DIR="$RUNNER_TEMP/signing_bundle"
+          #
+          # Deliberately under $GITHUB_WORKSPACE, NOT $RUNNER_TEMP: a real run
+          # confirmed match successfully created a cert here, but by the time
+          # the final "Package updated signing bundle" step ran (~10min later,
+          # after a long gym archive + upload_to_testflight), the whole
+          # $RUNNER_TEMP/signing_bundle directory had vanished ("No such file
+          # or directory") — GitHub-hosted macOS runners appear to reclaim
+          # $RUNNER_TEMP disk space mid-job on long, disk-heavy builds.
+          # $GITHUB_WORKSPACE is the persistent job checkout dir and isn't
+          # subject to that same runner-managed cleanup.
+          export SIGNING_BUNDLE_DIR="$GITHUB_WORKSPACE/.signing_bundle"
           echo "SIGNING_BUNDLE_DIR=$SIGNING_BUNDLE_DIR" >> "$GITHUB_ENV"
           mkdir -p "$SIGNING_BUNDLE_DIR"
 

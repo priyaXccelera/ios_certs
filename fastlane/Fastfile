@@ -52,6 +52,34 @@ platform :ios do
       nil
     end
 
+    # Bundle-ID lookup can miss a real, already-published app when app.json's
+    # stored bundleIdentifier has drifted from what the app is ACTUALLY
+    # registered under in App Store Connect (e.g. imported/already-deployed
+    # projects rebuilt across different pipeline versions, or a bundle ID
+    # re-derived after app.json was hand-edited). App Store *display names*
+    # are globally unique, so if an app with this exact name already exists
+    # under a DIFFERENT bundle ID, `produce` would hard-fail with
+    # APP_NAME_TAKEN trying to create a duplicate — when what we actually
+    # want is to add a build to the app that already owns that name, not
+    # mint a second app. Fall back to a name-based lookup before giving up
+    # and calling produce.
+    if existing_app.nil?
+      existing_app = begin
+        Spaceship::ConnectAPI::App.all(filter: { name: app_name }).first
+      rescue => spaceship_err
+        UI.important("ASC API name lookup raised #{spaceship_err.class}: #{spaceship_err.message} — falling through to produce.")
+        nil
+      end
+      if existing_app
+        UI.important(
+          "No App Store Connect app found for bundle ID #{bundle_id}, but an app named " \
+          "'#{app_name}' already exists under bundle ID #{existing_app.bundle_id} (id: #{existing_app.id}). " \
+          "Reusing that existing app instead of creating a duplicate — app.json's stored bundle ID has " \
+          "drifted from the real one; match/gym below will build against #{existing_app.bundle_id}."
+        )
+      end
+    end
+
     if existing_app
       UI.message("App Store Connect app already exists for #{bundle_id} (id: #{existing_app.id}) — skipping produce.")
     else

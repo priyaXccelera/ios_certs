@@ -161,20 +161,35 @@ jobs:
           print(name)
           ")
 
-          # Bundle ID is derived ONLY from job_id — never from the app's
-          # current display name. A job's GenerationJob id stays fixed across
-          # its whole lifetime (initial generation, restarts, and every
-          # "Modify App" accept), so this keeps hitting the SAME bundle ID /
-          # App Store Connect app / TestFlight app across modifications. It
-          # used to also fold in a sanitized copy of the app name so two
-          # unrelated jobs with the same generic name ("Todo App") wouldn't
-          # collide — but since a *rename* mid-modify changed that sanitized
-          # name, it silently produced a brand-new bundle ID (and thus a
-          # brand-new TestFlight app) instead of just adding a new build to
-          # the existing one. job_id alone (a UUID) is already
-          # globally unique, so the name was never needed for uniqueness.
-          SAFE_JOB_ID=$(echo "$JOB_ID" | tr -cd 'a-z0-9-')
-          BUNDLE_ID="com.frontendx.job-${SAFE_JOB_ID}"
+          # Prefer a bundle ID the project ALREADY has (project/app.json's
+          # expo.ios.bundleIdentifier). This matters for GitHub-imported repos
+          # that are already live on TestFlight under their own bundle ID: if
+          # we minted a fresh job-scoped one instead, `produce` would try to
+          # register a brand-new App Store Connect app using the SAME display
+          # name the real app already owns — Apple rejects that as
+          # APP_NAME_TAKEN, and even if it didn't, it would create a second
+          # app instead of adding a build to the existing one.
+          #
+          # Only fall back to the synthetic com.frontendx.job-<job_id> ID when
+          # the project has no bundle ID yet (a fresh, never-before-built app)
+          # — job_id is fixed for a job's whole lifetime (initial generation,
+          # restarts, every "Modify App" accept), so that fallback still keeps
+          # hitting the same bundle ID / ASC app / TestFlight app across those.
+          EXISTING_BUNDLE_ID=$(python3 -c "
+          import json
+          data = json.load(open('$APP_JSON'))
+          root = data.get('expo', data)
+          print(root.get('ios', {}).get('bundleIdentifier', '') or '')
+          ")
+
+          if [ -n "$EXISTING_BUNDLE_ID" ]; then
+            BUNDLE_ID="$EXISTING_BUNDLE_ID"
+            echo "Using existing bundle ID from app.json (imported/already-published app): $BUNDLE_ID"
+          else
+            SAFE_JOB_ID=$(echo "$JOB_ID" | tr -cd 'a-z0-9-')
+            BUNDLE_ID="com.frontendx.job-${SAFE_JOB_ID}"
+            echo "No existing bundle ID in app.json — minting a fresh one for this job: $BUNDLE_ID"
+          fi
 
           echo "bundle_id=$BUNDLE_ID"   >> "$GITHUB_OUTPUT"
           echo "scheme=$RAW_NAME"       >> "$GITHUB_OUTPUT"

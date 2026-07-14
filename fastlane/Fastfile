@@ -226,16 +226,34 @@ platform :ios do
       # certs/profiles into ENV['SIGNING_BUNDLE_DIR'] before this lane runs
       # (no live network call), and re-uploads the (possibly updated)
       # directory as a build artifact afterward for the backend to persist.
-      match(
+      match_args = {
         type: "appstore",
-        readonly: false,
         api_key: api_key,
         storage_mode: "local_backend",
         app_identifier: bundle_id,
         team_id: ENV["APPLE_TEAM_ID"],
         keychain_name: ENV["MATCH_KEYCHAIN_NAME"],
         keychain_password: ENV["MATCH_KEYCHAIN_PASSWORD"],
-      )
+      }
+
+      # Try readonly first: reuse whatever cert/profile is already sitting in
+      # SIGNING_BUNDLE_DIR (the job owner's persisted bundle) without ever
+      # asking Apple to create anything. A *new* app's first build (no
+      # profile for this bundle_id yet) or a genuinely empty/stale bundle is
+      # expected to fail readonly — fall back to readonly: false so match
+      # provisions only what's actually missing (match's own normal behavior
+      # already reuses an existing, unexpired cert file within
+      # SIGNING_BUNDLE_DIR rather than minting a new one; this readonly-first
+      # pass is an extra safety net + a clear log signal distinguishing
+      # "reused" from "provisioned new", useful when chasing Apple's
+      # per-team distribution-cert limit).
+      begin
+        match(readonly: true, **match_args)
+        UI.message("match (readonly) reused an existing cert/profile for #{bundle_id} — nothing new provisioned.")
+      rescue => match_err
+        UI.important("match (readonly) found nothing usable for #{bundle_id} (#{match_err.class}: #{match_err.message}) — falling back to provisioning.")
+        match(readonly: false, **match_args)
+      end
 
       build_output_dir = File.join(project_root, "build")
       ipa_path = File.join(build_output_dir, "app.ipa")

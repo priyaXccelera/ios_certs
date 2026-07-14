@@ -72,6 +72,21 @@ module Match
         UI.message("[local_match_storage] delete_files called with #{files_to_delete.length} file(s): #{files_to_delete.join(', ')}")
       end
 
+      # No-op: the base Interface#clear_changes does
+      # `FileUtils.rm_rf(self.working_directory)`, which is correct for
+      # git/s3/gcloud backends (working_directory there is a disposable temp
+      # clone) but catastrophic here — working_directory IS bundle_dir, the
+      # persistent SIGNING_BUNDLE_DIR the workflow decrypted the user's real
+      # cert/profile into. `Match::Runner#run` calls storage.clear_changes
+      # in an `ensure`, i.e. after EVERY match() call including the Fastfile's
+      # readonly-probe attempt — left un-overridden, this wiped the signing
+      # bundle before it could ever be reused or re-persisted, guaranteeing a
+      # fresh Apple distribution cert was minted on every single build until
+      # the team's 2-cert limit was exhausted.
+      def clear_changes
+        self.working_directory = nil
+      end
+
       def skip_docs
         true
       end

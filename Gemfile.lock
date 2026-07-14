@@ -322,6 +322,7 @@ PLATFORMS
   arm-linux-musl
   arm64-darwin
   ruby
+  x64-mingw-ucrt
   x86-linux-gnu
   x86-linux-musl
   x86_64-darwin
@@ -331,6 +332,7 @@ PLATFORMS
 DEPENDENCIES
   cocoapods (~> 1.16)
   fastlane (~> 2.224)
+  xcodeproj (~> 1.26)
 
 BUNDLED WITH
    2.5.22

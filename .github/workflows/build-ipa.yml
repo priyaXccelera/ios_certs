@@ -199,26 +199,42 @@ jobs:
 
       # Inject the generated bundle ID into app.json before expo prebuild
       # so the native Xcode project is generated with the correct identifier.
-      - name: Patch app.json with derived bundle ID
+      #
+      # Also stamp a fresh build number/version code on every run. Apple (and
+      # Play Store) reject any upload whose build number/version code isn't
+      # strictly greater than the last one successfully uploaded for the same
+      # app version — since app.json's ios.buildNumber is static, every build
+      # after the first would otherwise collide and fail at
+      # upload_to_testflight with "bundle version must be higher than the
+      # previously uploaded version". github.run_number is unique and
+      # monotonically increasing per workflow run, so it's a simple correct
+      # fix with no need to query ASC for the last-used build number.
+      - name: Patch app.json with derived bundle ID and build number
         if: env.SKIP_BUILD != 'true'
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           python3 - <<'EOF'
-          import json
+          import json, os
 
           path = "project/app.json"
           with open(path) as f:
               data = json.load(f)
 
           bundle_id = "${{ steps.appinfo.outputs.bundle_id }}"
+          run_number = os.environ["RUN_NUMBER"]
 
           root = data.get("expo", data)
           root.setdefault("ios", {})["bundleIdentifier"] = bundle_id
+          root["ios"]["buildNumber"] = run_number
           root.setdefault("android", {})["package"] = bundle_id.replace("-", "_")
+          root["android"]["versionCode"] = int(run_number)
 
           with open(path, "w") as f:
               json.dump(data, f, indent=2)
 
           print(f"Patched bundleIdentifier → {bundle_id}")
+          print(f"Patched ios.buildNumber / android.versionCode → {run_number}")
           EOF
 
       # Decrypts the job owner's OWN Apple Developer / App Store Connect
